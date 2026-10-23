@@ -146,6 +146,20 @@ We provide two testing method.You can store the image or video.
 python demo.py  --source data/example.jpg
 ```
 
+### Situational Awareness Pipeline
+
+`demo.py` combines YOLOPv2 traffic detections, lane-line and drivable-area segmentation, and the YOLOv8 pothole model (`best.pt`). It extracts lane deviation, drivable-corridor coverage, traffic-object distance/TTC, and pothole severity, then applies the fuzzy inference system to calculate a situational-awareness score (SAS, 1-10), awareness level, braking intensity, and steering advisory.
+
+Run on an image, video, or image directory:
+
+```shell
+python demo.py --source path/to/road-image.jpg --device 0
+```
+
+The annotated image/video is saved under `runs/detect/exp`. Per-frame features and decisions are appended to `runs/detect/exp/situational_awareness.jsonl`. Use `--pothole-conf-thres 0.10` to include lower-confidence pothole candidates, or `--pothole-weights ""` to disable pothole inference. Use `--no-sas-json` to disable telemetry output.
+
+Distance, TTC, and pothole severity are approximate and depend on camera geometry. The defaults assume frames resized to 1280x720 and a camera height of 1.5 m. Supply calibrated values with `--camera-fx`, `--camera-fy`, `--camera-cx`, `--camera-cy`, `--camera-height`, and `--camera-pitch`. A `LIMITED DATA` status means lane/drivable features could not be reliably extracted for that frame. SAS is an experimental perception aid, not a safety-certified driving control.
+
 <!-- ## Usage
 coming soon. -->
 

@@ -1,4 +1,6 @@
 import argparse
+import json
+import math
 import time
 from pathlib import Path
 import cv2
@@ -12,11 +14,28 @@ from utils.utils import \
     AverageMeter,\
     LoadImages
 
+from egoroad_pipeline import CameraConfig, EgoRoadPipeline
+from yolov8_adapter import ultralytics_result_to_detections
+
+TRAFFIC_CLASS_NAMES = [
+    'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
+]
 
 
 def make_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='data/weights/yolopv2.pt', help='model.pt path(s)')
+    parser.add_argument('--weights', nargs='+', type=str, default=['data/weights/yolopv2.pt'], help='model.pt path(s)')
+    parser.add_argument('--pothole-weights', type=str, default='best.pt', help='YOLOv8 pothole model path; pass an empty string to disable')
+    parser.add_argument('--pothole-conf-thres', type=float, default=0.25, help='pothole confidence threshold')
+    parser.add_argument('--pothole-class', type=int, default=5, help='pothole class id in the YOLOv8 model')
+    parser.add_argument('--pothole-img-size', type=int, default=640, help='YOLOv8 inference size (pixels)')
+    parser.add_argument('--camera-fx', type=float, default=900.0, help='camera focal length x in pixels after resize')
+    parser.add_argument('--camera-fy', type=float, default=900.0, help='camera focal length y in pixels after resize')
+    parser.add_argument('--camera-cx', type=float, default=640.0, help='camera principal point x after resize')
+    parser.add_argument('--camera-cy', type=float, default=360.0, help='camera principal point y after resize')
+    parser.add_argument('--camera-height', type=float, default=1.5, help='camera height above road in meters')
+    parser.add_argument('--camera-pitch', type=float, default=2.0, help='camera pitch in degrees')
+    parser.add_argument('--no-sas-json', action='store_true', help='disable per-frame situational awareness JSONL output')
     parser.add_argument('--source', type=str, default='data/example.jpg', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.3, help='object confidence threshold')
@@ -33,6 +52,83 @@ def make_parser():
     return parser
 
 
+def draw_situational_awareness(image, features, decision):
+    width = image.shape[1]
+    panel_width = min(720, width - 20)
+    panel_height = 122
+    level_color = {
+        'HIGH': (50, 170, 50),
+        'MODERATE': (0, 180, 230),
+        'LOW': (0, 0, 220),
+    }.get(decision.awareness, (90, 90, 90))
+
+    overlay = image.copy()
+    cv2.rectangle(overlay, (10, 10), (10 + panel_width, 10 + panel_height), (20, 24, 24), -1)
+    cv2.addWeighted(overlay, 0.78, image, 0.22, 0, image)
+    cv2.rectangle(image, (10, 10), (10 + panel_width, 10 + panel_height), level_color, 2)
+
+    nearest_distance = (
+        f'{features.nearest_object_distance_m:.1f} m'
+        if math.isfinite(features.nearest_object_distance_m) else 'n/a'
+    )
+    ttc = f'{features.ttc_s:.1f} s' if math.isfinite(features.ttc_s) else 'n/a'
+    pothole_distance = (
+        f'{features.nearest_pothole_distance_m:.1f} m'
+        if math.isfinite(features.nearest_pothole_distance_m) else 'n/a'
+    )
+    awareness = decision.awareness if features.feature_valid else f'{decision.awareness} - LIMITED DATA'
+    lines = [
+        (f'Situational awareness  {decision.sas:.1f}/10  {awareness}', level_color, 0.62, 2),
+        (f'Lane deviation {features.lane_deviation_m:.2f} m   Drivable {features.drivable_ratio:.0%}', (245, 245, 245), 0.48, 1),
+        (f'Nearest {features.nearest_object_class}: {nearest_distance}   TTC {ttc}', (245, 245, 245), 0.48, 1),
+        (f'Pothole severity {features.pothole_severity:.2f}   {pothole_distance}   Brake {decision.braking_intensity:.0%} {decision.steering}', (245, 245, 245), 0.43, 1),
+    ]
+    for index, (text, color, scale, thickness) in enumerate(lines):
+        cv2.putText(image, text, (22, 35 + index * 27), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def draw_pothole_detections(image, result, class_names):
+    for box in result.boxes:
+        x1, y1, x2, y2 = box.xyxy[0].round().int().tolist()
+        class_id = int(box.cls[0])
+        confidence = float(box.conf[0])
+        label = f'{class_names[class_id]} {confidence:.2f}'
+        color = (0, 0, 255)
+
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+        )
+        label_top = max(y1 - text_height - baseline - 6, 0)
+        cv2.rectangle(
+            image,
+            (x1, label_top),
+            (x1 + text_width + 8, label_top + text_height + baseline + 6),
+            color,
+            -1,
+        )
+        cv2.putText(
+            image,
+            label,
+            (x1 + 4, label_top + text_height + 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+
 def detect():
     # setting and directories
     source, weights,  save_txt, imgsz = opt.source, opt.weights,  opt.save_txt, opt.img_size
@@ -47,7 +143,7 @@ def detect():
 
     # Load model
     stride =32
-    model  = torch.jit.load(weights)
+    model  = torch.jit.load(weights[0])
     device = select_device(opt.device)
     half = device.type != 'cpu'  # half precision only supported on CUDA
     model = model.to(device)
@@ -55,6 +151,26 @@ def detect():
     if half:
         model.half()  # to FP16  
     model.eval()
+
+    awareness_pipeline = EgoRoadPipeline(CameraConfig(
+        fx=opt.camera_fx,
+        fy=opt.camera_fy,
+        cx=opt.camera_cx,
+        cy=opt.camera_cy,
+        height_m=opt.camera_height,
+        pitch_deg=opt.camera_pitch,
+    ))
+
+    pothole_model = None
+    if opt.pothole_weights:
+        pothole_weights = Path(opt.pothole_weights)
+        if not pothole_weights.is_file():
+            raise FileNotFoundError(f'YOLOv8 pothole weights not found: {pothole_weights}')
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise ImportError('Install the YOLOv8 dependency with: pip install ultralytics') from exc
+        pothole_model = YOLO(str(pothole_weights))
 
     # Set Dataloader
     vid_path, vid_writer = None, None
@@ -90,6 +206,16 @@ def detect():
 
         da_seg_mask = driving_area_mask(seg)
         ll_seg_mask = lane_line_mask(ll)
+        pothole_result = None
+        if pothole_model is not None:
+            pothole_result = pothole_model.predict(
+                source=im0s,
+                imgsz=opt.pothole_img_size,
+                conf=opt.pothole_conf_thres,
+                classes=[opt.pothole_class],
+                device=0 if device.type == 'cuda' else 'cpu',
+                verbose=False,
+            )[0]
 
         # Process detections
         for i, det in enumerate(pred):  # detections per image
@@ -104,6 +230,22 @@ def detect():
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+
+            traffic_detections = []
+            for box in det:
+                x1, y1, x2, y2, confidence, class_id = box.tolist()
+                class_id = int(class_id)
+                class_name = (
+                    TRAFFIC_CLASS_NAMES[class_id]
+                    if 0 <= class_id < len(TRAFFIC_CLASS_NAMES)
+                    else f'traffic_object_{class_id}'
+                )
+                traffic_detections.append({
+                    'bbox': [x1, y1, x2, y2],
+                    'conf': confidence,
+                    'class_id': class_id,
+                    'class_name': class_name,
+                })
 
                 # Print results
                 for c in det[:, -1].unique():
@@ -124,6 +266,37 @@ def detect():
             # Print time (inference)
             print(f'{s}Done. ({t2 - t1:.3f}s)')
             show_seg_result(im0, (da_seg_mask,ll_seg_mask), is_demo=True)
+            if pothole_result is not None:
+                draw_pothole_detections(im0, pothole_result, pothole_model.names)
+
+            pothole_detections = ultralytics_result_to_detections(
+                pothole_result,
+                pothole_model.names if pothole_model is not None else None,
+            )
+            features, decision = awareness_pipeline.process(
+                {
+                    'lane_mask': ll_seg_mask,
+                    'drive_mask': da_seg_mask,
+                    'traffic': traffic_detections,
+                },
+                pothole_detections,
+            )
+            draw_situational_awareness(im0, features, decision)
+
+            ttc_text = f'{features.ttc_s:.1f}s' if math.isfinite(features.ttc_s) else 'n/a'
+            data_status = '' if features.feature_valid else ' (LIMITED DATA)'
+            print(
+                f'SAS {decision.sas:.1f}/10 {decision.awareness}{data_status}; '
+                f'TTC {ttc_text}; pothole severity {features.pothole_severity:.2f}'
+            )
+            if not opt.no_sas_json:
+                record = {
+                    'source': str(p),
+                    'frame': frame,
+                    **EgoRoadPipeline.to_dict(features, decision),
+                }
+                with open(save_dir / 'situational_awareness.jsonl', 'a', encoding='utf-8') as output_file:
+                    output_file.write(json.dumps(_json_safe(record), allow_nan=False) + '\n')
 
             # Save results (image with detections)
             if save_img:
