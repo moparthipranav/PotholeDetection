@@ -13,6 +13,7 @@ torchvision>=0.15.0
 tqdm>=4.41.0
 protobuf<4.21.3
 ultralytics>=8.0.0
+streamlit>=1.32.0
 
 # Logging -------------------------------------
 tensorboard>=2.4.1
