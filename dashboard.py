@@ -70,14 +70,16 @@ def display_percent(value):
     return f"{number * 100:.0f}%" if number is not None else "—"
 
 
-def find_media(run_dir: Path, source: str):
-    if not source or source.isdigit():
-        return None
-    media_path = run_dir / Path(source).name
-    if media_path.is_file() and media_path.suffix.lower() in (
-        VIDEO_SUFFIXES | IMAGE_SUFFIXES
-    ):
-        return media_path
+def find_media(run_dir: Path, source: str, annotated_media: Optional[str] = None):
+    for candidate in (annotated_media, source):
+        if not isinstance(candidate, str) or not candidate or candidate.isdigit():
+            continue
+        basename = Path(candidate.replace("\\", "/")).name
+        media_path = run_dir / basename
+        if media_path.is_file() and media_path.suffix.lower() in (
+            VIDEO_SUFFIXES | IMAGE_SUFFIXES
+        ):
+            return media_path
     return None
 
 
@@ -292,7 +294,11 @@ def main():
             st.caption(f"Uploaded frame: {uploaded_frame.name}")
         else:
             show_media(
-                find_media(run_dir, source) if run_dir is not None else None,
+                find_media(
+                    run_dir,
+                    source,
+                    record.get("annotated_media"),
+                ) if run_dir is not None else None,
                 record,
             )
     with right:

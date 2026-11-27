@@ -59,6 +59,17 @@ class DashboardTests(unittest.TestCase):
             )
             self.assertIsNone(find_media(run, "0"))
 
+    def test_media_lookup_prefers_annotated_media_name(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run = Path(temporary_directory)
+            video = run / "road-preview.mp4"
+            video.touch()
+
+            self.assertEqual(
+                find_media(run, r"D:\input\road.avi", "road-preview.mp4"),
+                video,
+            )
+
     def test_fractional_advisory_values_are_rendered_as_percent(self):
         self.assertEqual(display_percent(0.587), "59%")
         self.assertEqual(display_percent(None), "—")
